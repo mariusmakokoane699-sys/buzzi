@@ -1,56 +1,57 @@
-# Build Workflow for Android
-
-name: Build
+name: Build BUZZI APK
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-    - name: Setup JDK
-      uses: actions/setup-java@v1
-      with:
-        java-version: '11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-    - name: Setup Android SDK
-      env:
-        ANDROID_HOME: /usr/local/androidsdk
-      run: |
-        mkdir -p $ANDROID_HOME;
-        cd $ANDROID_HOME;
-        wget https://dl.google.com/android/repository/commandlinetools-linux-6858069_latest.zip;
-        unzip commandlinetools-linux-6858069_latest.zip;
-        yes | sdkmanager --licenses;
-        sdkmanager "platforms;android-30" "build-tools;30.0.3"
+      - uses: android-actions/setup-android@v2
+        with:
+          api-level: 31
+          ndk-version: 25.1.8937393
 
-    - name: Setup NDK
-      run: |
-        wget https://dl.google.com/android/repository/android-ndk-r21d-linux-x86_64.zip;
-        unzip android-ndk-r21d-linux-x86_64.zip -d $ANDROID_HOME/ndk;
-        export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/android-ndk-r21d
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-    - name: Build Project
-      run: |
-        ./gradlew assembleDebug || { echo 'Build failed!'; exit 1; }
+      - name: Init React Native project
+        run: npx --yes react-native@0.76 init BuzziApp --package-name com.buzzi
 
-    - name: Deploy Artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: android-build
-        path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Install dependencies
+        working-directory: BuzziApp
+        run: |
+          npm install
+          npm install @react-native-async-storage/async-storage@^2.1.0
 
-    - name: Cleanup
-      run: |
-        rm -rf $ANDROID_HOME/ndk/android-ndk-r21d
-        rm -rf $ANDROID_HOME/commandlinetools
+      - name: Write BUZZI source files
+        working-directory: BuzziApp
+        run: |
+          python3 << 'PYEOF'
+          # ... [paste all the Python code from your original workflow here]
+          PYEOF
 
-        
-          
+      - name: Build APK
+        working-directory: BuzziApp/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug -Dorg.gradle.jvmargs="-Xmx4g"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUZZI-debug-apk
+          path: BuzziApp/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
