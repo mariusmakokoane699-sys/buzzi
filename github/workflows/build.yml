@@ -1,39 +1,43 @@
-import os
+name: Build
 
-# Create setup.py
-setup_content = """
-from setuptools import setup, find_packages
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
 
-setup(
-    name='your_package_name',
-    version='0.1',
-    packages=find_packages(),
-    install_requires=[],
-)
-"""
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-with open('setup.py', 'w') as setup_file:
-    setup_file.write(setup_content)
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
 
-# Create index.js
-index_js_content = """
-console.log('Hello, World!');
-"""
+    steps:
+    - uses: actions/checkout@v3
 
-with open('index.js', 'w') as index_file:
-    index_file.write(index_js_content)
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
 
-# Create App.tsx
-app_tsx_content = """
-import React from 'react';
+    - name: Install dependencies
+      run: npm ci
 
-const App = () => {
-    return <h1>Hello, World!</h1>;
-};
+    - name: Run linter
+      run: npm run lint --if-present
 
-export default App;
-"""
+    - name: Build project
+      run: npm run build --if-present
 
-with open('App.tsx', 'w') as app_file:
-    app_file.write(app_tsx_content)
+    - name: Run tests
+      run: npm test --if-present
 
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      if: always()
+      with:
+        files: ./coverage/coverage-final.json
+        fail_ci_if_error: false
