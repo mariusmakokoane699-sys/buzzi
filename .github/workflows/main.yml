@@ -1,0 +1,976 @@
+
+name: Build BUZZI APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Accept Android licences
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Init React Native project
+        run: npx --yes react-native@0.76 init BuzziApp --package-name com.buzzi
+
+      - name: Install extra dependencies
+        working-directory: BuzziApp
+        run: npm install @react-native-async-storage/async-storage@^2.1.0
+
+      - name: Write all BUZZI source files
+        working-directory: BuzziApp
+        run: |
+          python3 - << 'PYEOF'
+          import os
+
+          def w(path, txt):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              open(path, 'w').write(txt)
+
+          KT = 'android/app/src/main/kotlin/com/buzzi'
+          os.makedirs(KT + '/telephony', exist_ok=True)
+          os.makedirs(KT + '/contacts', exist_ok=True)
+
+          w('android/app/src/main/AndroidManifest.xml', '''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.CALL_PHONE"/>
+  <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+  <uses-permission android:name="android.permission.WRITE_CALL_LOG"/>
+  <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS"/>
+  <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+  <uses-permission android:name="android.permission.PROCESS_OUTGOING_CALLS"/>
+  <uses-permission android:name="android.permission.READ_CONTACTS"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.VIBRATE"/>
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+  <uses-permission android:name="android.permission.WAKE_LOCK"/>
+  <uses-feature android:name="android.hardware.telephony" android:required="true"/>
+  <application
+    android:name=".MainApplication"
+    android:label="BUZZI"
+    android:icon="@mipmap/ic_launcher"
+    android:roundIcon="@mipmap/ic_launcher_round"
+    android:allowBackup="false"
+    android:theme="@style/AppTheme"
+    android:usesCleartextTraffic="true">
+    <activity
+      android:name=".MainActivity"
+      android:label="BUZZI"
+      android:configChanges="keyboard|keyboardHidden|orientation|screenSize|uiMode"
+      android:launchMode="singleTask"
+      android:windowSoftInputMode="adjustResize"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+    <service android:name=".telephony.SignalListenerService"
+      android:enabled="true" android:exported="false"
+      android:foregroundServiceType="phoneCall"/>
+    <receiver android:name=".telephony.BootReceiver" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED"/>
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>
+''')
+
+          w(KT + '/MainApplication.kt', '''package com.buzzi
+import android.app.Application
+import com.buzzi.contacts.BuzziContactsPackage
+import com.buzzi.telephony.BuzziTelephonyPackage
+import com.facebook.react.PackageList
+import com.facebook.react.ReactApplication
+import com.facebook.react.ReactHost
+import com.facebook.react.ReactNativeHost
+import com.facebook.react.ReactPackage
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.load
+import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
+import com.facebook.react.defaults.DefaultReactNativeHost
+import com.facebook.react.soloader.OpenSourceMergedSoMapping
+import com.facebook.soloader.SoLoader
+class MainApplication : Application(), ReactApplication {
+  override val reactNativeHost: ReactNativeHost =
+    object : DefaultReactNativeHost(this) {
+      override fun getPackages(): List<ReactPackage> =
+        PackageList(this).packages.apply {
+          add(BuzziTelephonyPackage())
+          add(BuzziContactsPackage())
+        }
+      override fun getJSMainModuleName(): String = "index"
+      override fun getUseDeveloperSupport(): Boolean = BuildConfig.DEBUG
+      override val isNewArchEnabled: Boolean = BuildConfig.IS_NEW_ARCHITECTURE_ENABLED
+      override val isHermesEnabled: Boolean = BuildConfig.IS_HERMES_ENABLED
+    }
+  override val reactHost: ReactHost
+    get() = getDefaultReactHost(applicationContext, reactNativeHost)
+  override fun onCreate() {
+    super.onCreate()
+    SoLoader.init(this, OpenSourceMergedSoMapping)
+    if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) load()
+  }
+}
+''')
+
+          w(KT + '/MainActivity.kt', '''package com.buzzi
+import android.os.Bundle
+import com.facebook.react.ReactActivity
+import com.facebook.react.ReactActivityDelegate
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
+import com.facebook.react.defaults.DefaultReactActivityDelegate
+class MainActivity : ReactActivity() {
+  override fun getMainComponentName(): String = "BuzziApp"
+  override fun createReactActivityDelegate(): ReactActivityDelegate =
+    DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
+  override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState) }
+}
+''')
+
+          w(KT + '/telephony/BuzziTelephonyModule.kt', '''package com.buzzi.telephony
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.telecom.TelecomManager
+import android.telephony.PhoneStateListener
+import android.telephony.TelephonyManager
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import com.facebook.react.bridge.*
+import com.facebook.react.modules.core.DeviceEventManagerModule
+class BuzziTelephonyModule(private val ctx: ReactApplicationContext)
+    : ReactContextBaseJavaModule(ctx) {
+  companion object {
+    const val BASE_MS = 500.0
+    const val MAX_MS  = 2000.0
+    const val EV_DECODED  = "BuzziWordDecoded"
+    const val EV_SENT     = "BuzziSignalSent"
+    const val EV_INCOMING = "BuzziIncomingSignal"
+  }
+  override fun getName() = "BuzziTelephony"
+  private val handler = Handler(Looper.getMainLooper())
+  private var hangup: Runnable? = null
+  private var listener: PhoneStateListener? = null
+  private var ringStart = 0L
+  private var listening = false
+
+  @ReactMethod
+  fun triggerSignal(number: String, durationMs: Double, promise: Promise) {
+    val activity = currentActivity ?: return promise.reject("NO_ACTIVITY","No activity")
+    if (!hasPerm(Manifest.permission.CALL_PHONE))
+      return promise.reject("NO_PERM","CALL_PHONE not granted")
+    val ms = minOf(durationMs, MAX_MS).toLong()
+    hangup?.let { handler.removeCallbacks(it) }
+    try {
+      activity.startActivity(
+        Intent(Intent.ACTION_CALL, Uri.parse("tel:${clean(number)}")).apply {
+          flags = Intent.FLAG_ACTIVITY_NEW_TASK })
+      hangup = Runnable {
+        endCall()
+        handler.postDelayed({
+          val res = Arguments.createMap().apply {
+            putString("number", number)
+            putDouble("requestedMs", durationMs)
+            putDouble("clampedMs", ms.toDouble())
+            putBoolean("success", true)
+          }
+          promise.resolve(res)
+          emit(EV_SENT, res)
+        }, 1200)
+      }
+      handler.postDelayed(hangup!!, ms)
+    } catch (e: Exception) { promise.reject("ERR", e.message) }
+  }
+
+  @ReactMethod
+  fun startListening(from: String, promise: Promise) {
+    if (listening) return promise.resolve("already")
+    if (!hasPerm(Manifest.permission.READ_PHONE_STATE))
+      return promise.reject("NO_PERM","READ_PHONE_STATE not granted")
+    val tm = ctx.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+    val fromTail = clean(from).takeLast(7)
+    listener = object : PhoneStateListener() {
+      override fun onCallStateChanged(state: Int, raw: String?) {
+        val tail = raw?.replace(Regex("[^0-9]"),"")?.takeLast(7) ?: ""
+        when (state) {
+          TelephonyManager.CALL_STATE_RINGING -> {
+            if (fromTail.isEmpty() || tail == fromTail) {
+              ringStart = System.currentTimeMillis()
+              emit(EV_INCOMING, Arguments.createMap().apply {
+                putString("from", raw ?: ""); putString("event","RINGING") })
+            }
+          }
+          TelephonyManager.CALL_STATE_IDLE -> {
+            if (ringStart > 0) {
+              val dur = System.currentTimeMillis() - ringStart
+              ringStart = 0L
+              val idx = Math.round((dur.toDouble() - BASE_MS) * 100).toInt()
+              emit(EV_DECODED, Arguments.createMap().apply {
+                putDouble("durationMs", dur.toDouble())
+                putInt("index", idx)
+                putString("from", raw ?: "")
+                putBoolean("valid", idx in 0..500000)
+              })
+            }
+          }
+          TelephonyManager.CALL_STATE_OFFHOOK -> ringStart = 0L
+        }
+      }
+    }
+    @Suppress("DEPRECATION")
+    tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
+    listening = true
+    promise.resolve("listening")
+  }
+
+  @ReactMethod
+  fun stopListening(promise: Promise) {
+    listener?.let {
+      val tm = ctx.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+      @Suppress("DEPRECATION")
+      tm.listen(it, PhoneStateListener.LISTEN_NONE)
+      listener = null
+    }
+    listening = false
+    promise.resolve("stopped")
+  }
+
+  @ReactMethod
+  fun checkPermissions(promise: Promise) {
+    promise.resolve(Arguments.createMap().apply {
+      listOf("CALL_PHONE" to Manifest.permission.CALL_PHONE,
+             "READ_PHONE_STATE" to Manifest.permission.READ_PHONE_STATE,
+             "READ_CALL_LOG" to Manifest.permission.READ_CALL_LOG,
+             "READ_CONTACTS" to Manifest.permission.READ_CONTACTS)
+        .forEach { (k,v) -> putBoolean(k, hasPerm(v)) }
+    })
+  }
+
+  private fun endCall(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasPerm(Manifest.permission.ANSWER_PHONE_CALLS)) {
+      try {
+        val tm = ctx.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        @Suppress("DEPRECATION")
+        if (tm.endCall()) return true
+      } catch (_: Exception) {}
+    }
+    try {
+      val tm = ctx.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+      val m = tm.javaClass.getDeclaredMethod("getITelephony").apply { isAccessible=true }
+      val it = m.invoke(tm)
+      it.javaClass.getDeclaredMethod("endCall").apply { isAccessible=true }.invoke(it)
+      return true
+    } catch (_: Exception) {}
+    return false
+  }
+
+  private fun emit(event: String, params: WritableMap?) =
+    ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(event, params)
+  private fun hasPerm(p: String) =
+    ActivityCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
+  private fun clean(n: String): String {
+    val d = n.replace(Regex("[^0-9+]"),"")
+    return if (d.startsWith("0") && d.length==10) "+27${d.drop(1)}" else d
+  }
+}
+''')
+
+          w(KT + '/telephony/BuzziTelephonyPackage.kt', '''package com.buzzi.telephony
+import com.facebook.react.ReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.uimanager.ViewManager
+class BuzziTelephonyPackage : ReactPackage {
+  override fun createNativeModules(c: ReactApplicationContext): List<NativeModule> = listOf(BuzziTelephonyModule(c))
+  override fun createViewManagers(c: ReactApplicationContext): List<ViewManager<*,*>> = emptyList()
+}
+''')
+
+          w(KT + '/telephony/SignalListenerService.kt', '''package com.buzzi.telephony
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.buzzi.MainActivity
+class SignalListenerService : Service() {
+  companion object {
+    const val CHANNEL_ID = "buzzi_ch"
+    const val NOTIF_ID = 1001
+    fun start(ctx: Context) {
+      val i = Intent(ctx, SignalListenerService::class.java)
+      if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+    }
+  }
+  override fun onCreate() { super.onCreate(); createChannel() }
+  override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+    startForeground(NOTIF_ID, buildNotif()); return START_STICKY
+  }
+  override fun onBind(i: Intent?): IBinder? = null
+  private fun buildNotif(): Notification {
+    val pi = PendingIntent.getActivity(this, 0,
+      Intent(this, MainActivity::class.java),
+      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    return NotificationCompat.Builder(this, CHANNEL_ID)
+      .setContentTitle("BUZZI Signal Active")
+      .setContentText("Listening for incoming signals...")
+      .setSmallIcon(android.R.drawable.ic_dialog_info)
+      .setContentIntent(pi).setOngoing(true).setSilent(true).build()
+  }
+  private fun createChannel() {
+    if (Build.VERSION.SDK_INT >= 26) {
+      val ch = NotificationChannel(CHANNEL_ID, "Buzzi", NotificationManager.IMPORTANCE_LOW)
+      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+    }
+  }
+}
+''')
+
+          w(KT + '/telephony/BootReceiver.kt', '''package com.buzzi.telephony
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+class BootReceiver : BroadcastReceiver() {
+  override fun onReceive(ctx: Context, i: Intent) {
+    if (i.action == Intent.ACTION_BOOT_COMPLETED) SignalListenerService.start(ctx)
+  }
+}
+''')
+
+          w(KT + '/contacts/BuzziContactsModule.kt', '''package com.buzzi.contacts
+import android.Manifest
+import android.content.pm.PackageManager
+import android.provider.ContactsContract
+import androidx.core.app.ActivityCompat
+import com.facebook.react.bridge.*
+class BuzziContactsModule(private val ctx: ReactApplicationContext)
+    : ReactContextBaseJavaModule(ctx) {
+  override fun getName() = "BuzziContacts"
+  @ReactMethod
+  fun getContacts(promise: Promise) {
+    if (!hasPerm(Manifest.permission.READ_CONTACTS))
+      return promise.reject("NO_PERM","READ_CONTACTS not granted")
+    try {
+      val arr = Arguments.createArray()
+      val seen = mutableSetOf<String>()
+      val cursor = ctx.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        arrayOf(
+          ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+          ContactsContract.CommonDataKinds.Phone.NUMBER,
+          ContactsContract.CommonDataKinds.Phone.PHOTO_THUMBNAIL_URI,
+          ContactsContract.CommonDataKinds.Phone.STARRED,
+        ), null, null,
+        "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} COLLATE NOCASE ASC"
+      )
+      cursor?.use { c ->
+        val iId    = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
+        val iName  = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+        val iNum   = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        val iPhoto = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.PHOTO_THUMBNAIL_URI)
+        val iStar  = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.STARRED)
+        while (c.moveToNext()) {
+          val id = c.getString(iId) ?: continue
+          if (seen.contains(id)) continue; seen.add(id)
+          val name = c.getString(iName)?.trim() ?: continue
+          val raw  = c.getString(iNum) ?: continue
+          val num  = normalise(raw)
+          val photo = c.getString(iPhoto)
+          arr.pushMap(Arguments.createMap().apply {
+            putString("id", id); putString("name", name)
+            putString("number", num); putString("rawNumber", raw.trim())
+            putString("initials", initials(name))
+            putString("avatarColor", color(name))
+            putBoolean("starred", c.getInt(iStar) == 1)
+            if (photo != null) putString("photo", photo) else putNull("photo")
+          })
+        }
+      }
+      promise.resolve(arr)
+    } catch (e: Exception) { promise.reject("ERR", e.message) }
+  }
+  @ReactMethod
+  fun searchContacts(query: String, promise: Promise) {
+    if (!hasPerm(Manifest.permission.READ_CONTACTS))
+      return promise.reject("NO_PERM","READ_CONTACTS not granted")
+    try {
+      val arr = Arguments.createArray()
+      val seen = mutableSetOf<String>()
+      val q = "%${query.trim()}%"
+      val cursor = ctx.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        arrayOf(
+          ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+          ContactsContract.CommonDataKinds.Phone.NUMBER,
+          ContactsContract.CommonDataKinds.Phone.PHOTO_THUMBNAIL_URI,
+        ),
+        "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} LIKE ? OR ${ContactsContract.CommonDataKinds.Phone.NUMBER} LIKE ?",
+        arrayOf(q, q),
+        "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} ASC LIMIT 30"
+      )
+      cursor?.use { c ->
+        val iId    = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
+        val iName  = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+        val iNum   = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        val iPhoto = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.PHOTO_THUMBNAIL_URI)
+        while (c.moveToNext()) {
+          val id = c.getString(iId) ?: continue
+          if (seen.contains(id)) continue; seen.add(id)
+          val name = c.getString(iName)?.trim() ?: continue
+          val num  = normalise(c.getString(iNum) ?: continue)
+          arr.pushMap(Arguments.createMap().apply {
+            putString("id", id); putString("name", name); putString("number", num)
+            putString("initials", initials(name)); putString("avatarColor", color(name))
+            val ph = c.getString(iPhoto); if (ph != null) putString("photo", ph) else putNull("photo")
+          })
+        }
+      }
+      promise.resolve(arr)
+    } catch (e: Exception) { promise.reject("ERR", e.message) }
+  }
+  private fun normalise(raw: String): String {
+    val d = raw.replace(Regex("[^0-9+]"), "")
+    return when {
+      d.startsWith("0") && d.length == 10 -> "+27${d.drop(1)}"
+      d.startsWith("27") && d.length == 11 -> "+$d"
+      else -> d
+    }
+  }
+  private fun initials(name: String) =
+    name.split(Regex("\\s+")).filter { it.isNotBlank() }.take(2)
+      .mapNotNull { it.firstOrNull()?.uppercaseChar() }.joinToString("").ifEmpty { "?" }
+  private fun color(name: String): String {
+    val cols = listOf("#00BFFF","#0EA5E9","#7C3AED","#059669","#D97706","#DC2626","#0891B2","#9333EA")
+    return cols[Math.abs(name.hashCode()) % cols.size]
+  }
+  private fun hasPerm(p: String) =
+    ActivityCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
+}
+''')
+
+          w(KT + '/contacts/BuzziContactsPackage.kt', '''package com.buzzi.contacts
+import com.facebook.react.ReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.uimanager.ViewManager
+class BuzziContactsPackage : ReactPackage {
+  override fun createNativeModules(c: ReactApplicationContext): List<NativeModule> = listOf(BuzziContactsModule(c))
+  override fun createViewManagers(c: ReactApplicationContext): List<ViewManager<*,*>> = emptyList()
+}
+''')
+
+          w('index.js', """import {AppRegistry} from 'react-native';
+import App from './App';
+AppRegistry.registerComponent('BuzziApp', () => App);
+""")
+
+          w('App.tsx', r"""
+import React,{useState,useEffect,useRef,useCallback} from 'react';
+import {
+  View,Text,StyleSheet,TextInput,TouchableOpacity,FlatList,
+  Modal,Alert,StatusBar,ActivityIndicator,SafeAreaView,
+  KeyboardAvoidingView,Platform,Vibration,PermissionsAndroid,
+  NativeModules,NativeEventEmitter,Image,
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const {BuzziTelephony,BuzziContacts} = NativeModules;
+const emitter = BuzziTelephony ? new NativeEventEmitter(BuzziTelephony) : null;
+
+const BASE=500,MAX_MS=2000,COST=0.45;
+const toMs=(i)=>Math.min(BASE+i/100,MAX_MS);
+const haptic=()=>Vibration.vibrate([30,20,30]);
+
+const DICT=[
+  'a','abandon','ability','able','about','above','accept','account','achieve','across',
+  'act','action','actually','add','address','after','again','age','ago','agree',
+  'ahead','all','allow','almost','alone','along','already','also','although','always',
+  'am','among','amount','and','another','any','anyone','anything','anyway','appreciate',
+  'are','area','around','as','ask','at','available','away','balance','bank',
+  'be','because','been','before','best','better','between','big','both','budget',
+  'business','busy','but','buyer','by','call','can','care','carry','cause',
+  'cent','change','chat','cheap','check','clear','client','close','come','coming',
+  'company','confirm','connect','contact','cost','could','current','data','day','deal',
+  'dear','delivery','deposit','details','different','direct','discount','do','done','down',
+  'easy','end','enough','even','every','everything','except','expect','fee','feel',
+  'few','find','fine','first','for','forward','found','free','friend','from',
+  'full','funds','get','give','go','going','good','got','great','group',
+  'had','have','he','hello','help','her','here','hey','high','home',
+  'hope','how','however','income','if','important','in','interest','into','invest',
+  'invoice','is','it','its','just','keep','know','last','late','later',
+  'let','like','link','look','lot','love','low','made','make','many',
+  'may','maybe','market','me','mean','meet','meeting','message','might','miss',
+  'mobile','money','month','morning','more','most','much','must','my','name',
+  'near','need','network','never','new','next','nice','night','no','not',
+  'note','now','number','office','of','off','ok','okay','on','once',
+  'one','only','or','order','other','our','out','over','own','part',
+  'payment','people','percent','perfect','phone','place','plan','please','point','possible',
+  'price','problem','profit','project','quick','quote','rand','rate','reach','ready',
+  'real','really','receive','report','response','revenue','right','risk','run','said',
+  'same','sale','savings','say','schedule','see','send','service','set','she',
+  'should','show','signal','since','smart','so','solution','some','something','soon',
+  'sorry','status','still','strategy','support','sure','system','take','talk','target',
+  'team','tell','than','thank','thanks','that','the','their','them','then',
+  'there','they','thing','think','this','time','to','today','together','tomorrow',
+  'too','transfer','try','understand','until','up','update','us','use','value',
+  'vendor','very','wait','want','was','way','we','week','welcome','well',
+  'what','when','where','which','while','who','why','will','with','without',
+  'work','would','yeah','yes','yet','you','your','zero','approved','asap',
+  'attached','below','cash','confirm','copy','discuss','draft','ensure','financial',
+  'hereby','immediate','included','inform','letter','matter','noted','obtain',
+  'official','open','owner','per','proceed','regard','relevant','request','requires',
+  'review','signed','statement','submitted','tax','terms','through','urgent','valid',
+];
+const W2I={};
+DICT.forEach((w,i)=>{W2I[w]=i;});
+function encode(text){
+  return text.toLowerCase().replace(/[^a-z\s]/g,'').trim().split(/\s+/).filter(Boolean).map(w=>({
+    word:w,index:W2I[w]??-1,found:W2I[w]!==undefined,ms:W2I[w]!==undefined?toMs(W2I[w]):null
+  }));
+}
+function decode(indices){return indices.map(i=>DICT[i]??('[?'+i+']')).join(' ');}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function mkid(){return 'm'+Date.now()+Math.random().toString(36).slice(2,6);}
+function hhmm(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+
+async function requestPerms(){
+  if(Platform.OS!=='android')return;
+  await PermissionsAndroid.requestMultiple([
+    PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+    PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+    PermissionsAndroid.PERMISSIONS.READ_CALL_LOG,
+    PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
+    PermissionsAndroid.PERMISSIONS.ANSWER_PHONE_CALLS,
+  ]);
+}
+
+async function transmit(number,indices,onStep){
+  await BuzziTelephony.triggerSignal(number,toMs(indices.length));
+  haptic(); await sleep(300);
+  for(let i=0;i<indices.length;i++){
+    await BuzziTelephony.triggerSignal(number,toMs(indices[i]));
+    haptic(); onStep(i+1,indices.length,DICT[indices[i]]||'');
+    await sleep(250);
+  }
+}
+
+export default function App(){
+  const [screen,setScreen]=useState('home');
+  const [ready,setReady]=useState(false);
+  const [myNum,setMyNum]=useState('');
+  const [showNumModal,setShowNumModal]=useState(false);
+  const [numInput,setNumInput]=useState('');
+  const [convos,setConvos]=useState({});
+  const [contact,setContact]=useState(null);
+  const [contacts,setContacts]=useState([]);
+  const [contactQ,setContactQ]=useState('');
+  const [loadingC,setLoadingC]=useState(false);
+  const [input,setInput]=useState('');
+  const [sending,setSending]=useState(false);
+  const [prog,setProg]=useState({step:0,total:0,word:''});
+  const [tokens,setTokens]=useState([]);
+  const [inBuf,setInBuf]=useState([]);
+  const inTimer=useRef(null);
+  const listRef=useRef(null);
+  const subRef=useRef(null);
+
+  useEffect(()=>{boot();},[]);
+  const boot=async()=>{
+    await requestPerms();
+    const n=await AsyncStorage.getItem('buzzi_num');
+    if(n)setMyNum(n); else setShowNumModal(true);
+    const raw=await AsyncStorage.getItem('buzzi_convos');
+    if(raw)setConvos(JSON.parse(raw));
+    setReady(true);
+  };
+
+  const saveNum=async()=>{
+    const d=numInput.replace(/[^0-9]/g,'');
+    if(d.length<9){Alert.alert('Invalid','Enter your full number');return;}
+    const n=d.startsWith('0')?'+27'+d.slice(1):'+'+d;
+    setMyNum(n);
+    await AsyncStorage.setItem('buzzi_num',n);
+    setShowNumModal(false);
+  };
+
+  const persist=async(c)=>{
+    setConvos(c);
+    await AsyncStorage.setItem('buzzi_convos',JSON.stringify(c));
+  };
+
+  const openContacts=async()=>{
+    setLoadingC(true); setScreen('contacts'); setContactQ('');
+    try{const list=await BuzziContacts.getContacts(); setContacts(list);}
+    catch(e){Alert.alert('Error',e.message||'Grant READ_CONTACTS permission');}
+    finally{setLoadingC(false);}
+  };
+
+  const openChat=(c)=>{
+    setContact(c); setScreen('chat');
+    setInput(''); setTokens([]); setInBuf([]);
+    BuzziTelephony?.startListening(c.number).catch(()=>{});
+    if(subRef.current){subRef.current.remove(); subRef.current=null;}
+    subRef.current=emitter?.addListener('BuzziWordDecoded',(ev)=>{
+      if(!ev.valid)return;
+      haptic();
+      setInBuf(b=>{
+        const nb=[...b,ev.index];
+        if(inTimer.current)clearTimeout(inTimer.current);
+        inTimer.current=setTimeout(()=>{
+          if(nb.length===0)return;
+          const msg={id:mkid(),dir:'in',text:decode(nb),wc:nb.length,ic:nb.length,ts:Date.now(),status:'received'};
+          setConvos(prev=>{
+            const nxt={...prev};
+            const id=c.id;
+            if(!nxt[id])nxt[id]={name:c.name,number:c.number,msgs:[],words:0};
+            nxt[id]={...nxt[id],msgs:[...nxt[id].msgs,msg]};
+            AsyncStorage.setItem('buzzi_convos',JSON.stringify(nxt));
+            return nxt;
+          });
+          setTimeout(()=>listRef.current?.scrollToEnd({animated:true}),100);
+          setInBuf([]);
+        },3000);
+        return nb;
+      });
+    });
+  };
+
+  const appendMsg=(cid,cname,cnum,msg)=>{
+    setConvos(prev=>{
+      const nxt={...prev};
+      if(!nxt[cid])nxt[cid]={name:cname,number:cnum,msgs:[],words:0};
+      nxt[cid]={...nxt[cid],msgs:[...nxt[cid].msgs,msg],
+        words:nxt[cid].words+(msg.dir==='out'?msg.wc:0)};
+      AsyncStorage.setItem('buzzi_convos',JSON.stringify(nxt));
+      return nxt;
+    });
+    setTimeout(()=>listRef.current?.scrollToEnd({animated:true}),100);
+  };
+
+  useEffect(()=>{if(input.trim())setTokens(encode(input));else setTokens([]);},[input]);
+
+  const handleSend=useCallback(async()=>{
+    if(!input.trim()||sending||!contact)return;
+    const toks=encode(input.trim());
+    const valid=toks.filter(t=>t.found).map(t=>t.index);
+    if(!valid.length){Alert.alert('No matches','Try simpler words like: confirm payment send thank you');return;}
+    setSending(true); setInput(''); setTokens([]);
+    const msg={id:mkid(),dir:'out',text:input.trim(),wc:toks.length,ic:valid.length,ts:Date.now(),status:'sending'};
+    appendMsg(contact.id,contact.name,contact.number,msg);
+    try{
+      await transmit(contact.number,valid,(s,t,word)=>setProg({step:s,total:t,word}));
+      setConvos(prev=>{
+        const nxt={...prev};
+        if(nxt[contact.id])nxt[contact.id]={...nxt[contact.id],
+          msgs:nxt[contact.id].msgs.map(m=>m.id===msg.id?{...m,status:'sent'}:m)};
+        AsyncStorage.setItem('buzzi_convos',JSON.stringify(nxt));
+        return nxt;
+      });
+    }catch(e){Alert.alert('Signal Error',e.message);}
+    finally{setSending(false);setProg({step:0,total:0,word:''});}
+  },[input,sending,contact]);
+
+  const totalWords=Object.values(convos).reduce((s,c)=>s+c.words,0);
+  const savings=(totalWords*COST).toFixed(2);
+  const recentList=Object.entries(convos).map(([id,c])=>({id,...c}))
+    .sort((a,b)=>(b.msgs.at(-1)?.ts||0)-(a.msgs.at(-1)?.ts||0));
+  const msgs=contact?(convos[contact.id]?.msgs||[]):[];
+  const filteredC=contactQ?contacts.filter(c=>
+    c.name.toLowerCase().includes(contactQ.toLowerCase())||c.number.includes(contactQ)):contacts;
+
+  if(!ready)return(
+    <View style={[s.root,s.center]}>
+      <Text style={s.logo}>BUZZI</Text>
+      <ActivityIndicator color='#00BFFF' size='large' style={{marginTop:24}}/>
+      <Text style={s.sub}>Initialising signal layer…</Text>
+    </View>
+  );
+
+  if(screen==='contacts')return(
+    <SafeAreaView style={s.root}>
+      <StatusBar barStyle='dark-content' backgroundColor='#ffffff'/>
+      <View style={s.hdr}>
+        <TouchableOpacity onPress={()=>setScreen('home')}><Text style={s.back}>←</Text></TouchableOpacity>
+        <View style={{flex:1,marginLeft:10}}>
+          <Text style={s.hdrTitle}>New Signal</Text>
+          <Text style={s.hdrSub}>{contacts.length} contacts</Text>
+        </View>
+      </View>
+      <View style={s.searchWrap}>
+        <TextInput style={s.search} value={contactQ} onChangeText={setContactQ}
+          placeholder='Search contacts…' placeholderTextColor='#94a3b8'/>
+        {contactQ?<TouchableOpacity onPress={()=>setContactQ('')}><Text style={s.clearQ}>✕</Text></TouchableOpacity>:null}
+      </View>
+      {loadingC
+        ?<View style={s.center}><ActivityIndicator color='#00BFFF' size='large'/><Text style={s.sub}>Loading phonebook…</Text></View>
+        :<FlatList data={filteredC} keyExtractor={c=>c.id} keyboardShouldPersistTaps='handled'
+            contentContainerStyle={{padding:14,gap:8}}
+            ListEmptyComponent={<View style={s.center}><Text style={{color:'#94a3b8',marginTop:40}}>No contacts found</Text></View>}
+            renderItem={({item:c})=>(
+              <TouchableOpacity style={s.contactRow} onPress={()=>openChat(c)} activeOpacity={0.7}>
+                <View style={[s.av,{backgroundColor:c.avatarColor}]}>
+                  {c.photo?<Image source={{uri:c.photo}} style={s.avImg}/>:<Text style={s.avTxt}>{c.initials}</Text>}
+                </View>
+                <View style={{flex:1,marginLeft:12}}>
+                  <Text style={s.cName}>{c.name}</Text>
+                  <Text style={s.cNum}>{c.number}</Text>
+                </View>
+                {c.starred&&<Text style={{fontSize:14}}>⭐</Text>}
+              </TouchableOpacity>
+            )}
+          />
+      }
+    </SafeAreaView>
+  );
+
+  if(screen==='chat'&&contact)return(
+    <KeyboardAvoidingView style={s.root} behavior={Platform.OS==='ios'?'padding':'height'}>
+      <StatusBar barStyle='dark-content' backgroundColor='#ffffff'/>
+      <View style={s.hdr}>
+        <TouchableOpacity onPress={()=>{
+          BuzziTelephony?.stopListening().catch(()=>{});
+          subRef.current?.remove(); subRef.current=null;
+          setScreen('home');
+        }}><Text style={s.back}>←</Text></TouchableOpacity>
+        <View style={[s.av,{backgroundColor:contact.avatarColor,marginLeft:8}]}>
+          <Text style={s.avTxt}>{contact.initials}</Text>
+        </View>
+        <View style={{flex:1,marginLeft:10}}>
+          <Text style={s.hdrTitle}>{contact.name}</Text>
+          <Text style={s.hdrSub}>{contact.number} · 📡 Active</Text>
+        </View>
+        <View style={s.savPill}>
+          <Text style={s.savPillTxt}>R{((convos[contact.id]?.words||0)*COST).toFixed(2)} saved</Text>
+        </View>
+      </View>
+      {sending&&prog.total>0&&(
+        <View style={s.progBar}>
+          <Text style={s.progTxt}>📡 Sending "{prog.word}" — {prog.step}/{prog.total}</Text>
+          <View style={s.progTrack}><View style={[s.progFill,{width:(prog.step/prog.total*100)+'%'}]}/></View>
+        </View>
+      )}
+      {inBuf.length>0&&(
+        <View style={s.inBar}>
+          <ActivityIndicator size='small' color='#00BFFF'/>
+          <Text style={s.inTxt}>Receiving… {inBuf.length} word{inBuf.length!==1?'s':''}</Text>
+        </View>
+      )}
+      <FlatList ref={listRef} data={msgs} keyExtractor={m=>m.id}
+        contentContainerStyle={{padding:16,flexGrow:1}}
+        onContentSizeChange={()=>listRef.current?.scrollToEnd({animated:false})}
+        ListEmptyComponent={
+          <View style={[s.center,{paddingTop:60}]}>
+            <Text style={{fontSize:56,marginBottom:16}}>📡</Text>
+            <Text style={s.emptyTitle}>Begin Transmission</Text>
+            <Text style={s.emptySub}>Messages travel as zero-rated{'\n'}missed calls on Vodacom.</Text>
+          </View>
+        }
+        renderItem={({item:m})=>(
+          <View style={{marginBottom:12,alignItems:m.dir==='out'?'flex-end':'flex-start'}}>
+            <View style={[s.bubble,m.dir==='out'?s.bubOut:s.bubIn]}>
+              <Text style={{fontSize:15,lineHeight:22,color:m.dir==='out'?'#fff':'#1e293b'}}>{m.text}</Text>
+              <Text style={{fontSize:10,marginTop:5,color:m.dir==='out'?'rgba(255,255,255,0.6)':'#94a3b8'}}>
+                {m.dir==='out'?`${m.ic}/${m.wc} indexed · ${m.status==='sending'?'⏳':'✓'}`:`${m.wc} words decoded`}
+              </Text>
+            </View>
+            <Text style={s.ts}>{hhmm(m.ts)}</Text>
+          </View>
+        )}
+      />
+      {tokens.length>0&&(
+        <View style={s.tokenRow}>
+          {tokens.map((t,i)=>(
+            <View key={i} style={[s.token,t.found?s.tokenOk:s.tokenBad]}>
+              <Text style={{fontSize:12,fontWeight:'600',color:t.found?'#00BFFF':'#ef4444'}}>{t.word}</Text>
+              {t.found&&<Text style={{fontSize:9,color:'#94a3b8'}}>{t.ms?.toFixed(0)}ms</Text>}
+            </View>
+          ))}
+        </View>
+      )}
+      <View style={s.compose}>
+        <TextInput style={s.compInput} value={input} onChangeText={setInput}
+          placeholder='Compose signal…' placeholderTextColor='#94a3b8'
+          multiline editable={!sending}/>
+        <TouchableOpacity style={[s.sendBtn,(!input.trim()||sending)&&{opacity:0.4}]}
+          onPress={handleSend} disabled={!input.trim()||sending}>
+          {sending?<ActivityIndicator color='#fff' size='small'/>:<Text style={s.sendIcon}>↑</Text>}
+        </TouchableOpacity>
+      </View>
+    </KeyboardAvoidingView>
+  );
+
+  return(
+    <SafeAreaView style={s.root}>
+      <StatusBar barStyle='dark-content' backgroundColor='#f0f8ff'/>
+      <View style={s.hdr}>
+        <View>
+          <Text style={s.logo}>BUZZI</Text>
+          <Text style={s.sub}>Zero-Rated Signal Messenger</Text>
+        </View>
+        <View style={s.savCard}>
+          <Text style={{fontSize:8,fontWeight:'700',color:'#94a3b8',letterSpacing:1.5}}>SAVED</Text>
+          <Text style={{fontSize:20,fontWeight:'700',color:'#00BFFF'}}>R{savings}</Text>
+        </View>
+      </View>
+      <View style={s.statusRow}>
+        <View style={s.pip}/>
+        <Text style={{flex:1,fontSize:11,color:'#64748b'}}>Signal active · {myNum||'tap ✎ to set number'}</Text>
+        <TouchableOpacity onPress={()=>setShowNumModal(true)}><Text style={{color:'#00BFFF',fontSize:15,padding:4}}>✎</Text></TouchableOpacity>
+      </View>
+      <FlatList data={recentList} keyExtractor={c=>c.id}
+        contentContainerStyle={{padding:14,gap:8,flexGrow:1}}
+        ListEmptyComponent={
+          <View style={[s.center,{paddingTop:60}]}>
+            <Text style={{fontSize:64,marginBottom:20}}>📡</Text>
+            <Text style={s.emptyTitle}>No Conversations Yet</Text>
+            <Text style={s.emptySub}>Tap + to start a zero-rated{'\n'}signal message with any contact.</Text>
+            <TouchableOpacity style={s.startBtn} onPress={openContacts}>
+              <Text style={s.startBtnTxt}>Open Contacts</Text>
+            </TouchableOpacity>
+          </View>
+        }
+        renderItem={({item:c})=>{
+          const last=c.msgs.at(-1);
+          return(
+            <TouchableOpacity style={s.chatRow} onPress={()=>{
+              openChat({id:c.id,name:c.name,number:c.number,rawNumber:c.number,
+                initials:c.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(),
+                avatarColor:'#00BFFF',photo:null,starred:false});
+            }} activeOpacity={0.75}>
+              <View style={[s.av,{backgroundColor:'#00BFFF'}]}>
+                <Text style={s.avTxt}>{c.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()}</Text>
+              </View>
+              <View style={{flex:1,marginLeft:12}}>
+                <Text style={s.cName}>{c.name}</Text>
+                <Text style={s.cNum} numberOfLines={1}>{last?.text||'No messages'}</Text>
+              </View>
+              <View style={{alignItems:'flex-end',gap:4}}>
+                <Text style={{fontSize:11,color:'#94a3b8'}}>{last?hhmm(last.ts):''}</Text>
+                <View style={s.savPill}><Text style={s.savPillTxt}>R{(c.words*COST).toFixed(2)}</Text></View>
+              </View>
+            </TouchableOpacity>
+          );
+        }}
+      />
+      <TouchableOpacity style={s.fab} onPress={openContacts}>
+        <Text style={{fontSize:28,color:'#fff',lineHeight:32}}>+</Text>
+      </TouchableOpacity>
+      <Modal visible={showNumModal} transparent animationType='slide'>
+        <View style={s.overlay}>
+          <View style={s.modal}>
+            <Text style={s.hdrTitle}>Your Vodacom Number</Text>
+            <Text style={[s.sub,{marginBottom:20,marginTop:6}]}>Enter your number so contacts can signal back to you.</Text>
+            <TextInput style={s.modalInput} value={numInput} onChangeText={setNumInput}
+              placeholder='+27 82 000 0000' placeholderTextColor='#94a3b8'
+              keyboardType='phone-pad' autoFocus/>
+            <TouchableOpacity style={s.modalBtn} onPress={saveNum}>
+              <Text style={s.modalBtnTxt}>Save & Continue</Text>
+            </TouchableOpacity>
+            {myNum?<TouchableOpacity style={{paddingVertical:14,alignItems:'center'}} onPress={()=>setShowNumModal(false)}>
+              <Text style={{color:'#94a3b8'}}>Cancel</Text>
+            </TouchableOpacity>:null}
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const BLUE='#00BFFF',W='#FFFFFF';
+const SH={shadowColor:'#00BFFF',shadowOffset:{width:0,height:8},shadowOpacity:0.1,shadowRadius:20,elevation:6};
+const s=StyleSheet.create({
+  root:{flex:1,backgroundColor:'#f0f8ff'},
+  center:{flex:1,alignItems:'center',justifyContent:'center'},
+  logo:{fontSize:28,fontWeight:'700',color:BLUE,letterSpacing:5},
+  sub:{fontSize:11,color:'#94a3b8'},
+  hdr:{flexDirection:'row',alignItems:'center',padding:16,paddingTop:54,backgroundColor:W,...SH,borderBottomWidth:1,borderBottomColor:'rgba(0,191,255,0.08)'},
+  hdrTitle:{fontSize:16,fontWeight:'700',color:'#1e293b'},
+  hdrSub:{fontSize:11,color:'#94a3b8',marginTop:1},
+  back:{fontSize:22,color:BLUE,padding:4},
+  av:{width:42,height:42,borderRadius:14,alignItems:'center',justifyContent:'center',overflow:'hidden'},
+  avImg:{width:42,height:42,borderRadius:14},
+  avTxt:{fontSize:14,fontWeight:'700',color:W},
+  savCard:{marginLeft:'auto',backgroundColor:'#f0f9ff',padding:10,borderRadius:16,borderWidth:1,borderColor:'rgba(0,191,255,0.15)',alignItems:'center',minWidth:72},
+  savPill:{backgroundColor:'#f0fff4',paddingHorizontal:8,paddingVertical:3,borderRadius:10,borderWidth:1,borderColor:'#bbf7d0'},
+  savPillTxt:{fontSize:10,color:'#16a34a',fontWeight:'700'},
+  statusRow:{flexDirection:'row',alignItems:'center',gap:6,paddingHorizontal:16,paddingVertical:8,backgroundColor:'rgba(0,191,255,0.04)',borderBottomWidth:1,borderBottomColor:'rgba(0,191,255,0.06)'},
+  pip:{width:7,height:7,borderRadius:4,backgroundColor:'#22c55e'},
+  searchWrap:{flexDirection:'row',alignItems:'center',margin:14,backgroundColor:W,borderRadius:18,paddingHorizontal:14,borderWidth:1.5,borderColor:'rgba(0,191,255,0.2)',...SH},
+  search:{flex:1,paddingVertical:13,fontSize:15,color:'#1e293b'},
+  clearQ:{fontSize:14,color:'#94a3b8',padding:4},
+  contactRow:{flexDirection:'row',alignItems:'center',backgroundColor:W,borderRadius:18,padding:14,...SH,borderWidth:1,borderColor:'rgba(0,191,255,0.06)'},
+  cName:{fontSize:15,fontWeight:'700',color:'#1e293b'},
+  cNum:{fontSize:12,color:'#94a3b8',marginTop:2},
+  chatRow:{flexDirection:'row',alignItems:'center',backgroundColor:W,borderRadius:20,padding:14,...SH,borderWidth:1,borderColor:'rgba(0,191,255,0.06)'},
+  bubble:{maxWidth:'78%',borderRadius:20,padding:12,marginBottom:0},
+  bubOut:{backgroundColor:BLUE,borderBottomRightRadius:5,...SH},
+  bubIn:{backgroundColor:W,borderBottomLeftRadius:5,...SH,borderWidth:1,borderColor:'rgba(0,191,255,0.1)'},
+  ts:{fontSize:10,color:'#94a3b8',marginTop:3,paddingHorizontal:2},
+  emptyTitle:{fontSize:20,fontWeight:'700',color:'#1e293b',marginBottom:8},
+  emptySub:{fontSize:13,color:'#94a3b8',textAlign:'center',lineHeight:20,marginBottom:28},
+  startBtn:{backgroundColor:BLUE,paddingHorizontal:28,paddingVertical:14,borderRadius:18,...SH},
+  startBtnTxt:{color:W,fontWeight:'700',fontSize:15},
+  progBar:{backgroundColor:'rgba(0,191,255,0.05)',padding:10,paddingHorizontal:16},
+  progTxt:{fontSize:12,color:BLUE,fontWeight:'500',marginBottom:6},
+  progTrack:{height:3,backgroundColor:'rgba(0,191,255,0.15)',borderRadius:2,overflow:'hidden'},
+  progFill:{height:'100%',backgroundColor:BLUE,borderRadius:2},
+  inBar:{flexDirection:'row',alignItems:'center',gap:8,padding:10,paddingHorizontal:16,backgroundColor:'rgba(0,191,255,0.04)'},
+  inTxt:{fontSize:12,color:BLUE,fontWeight:'500'},
+  tokenRow:{flexDirection:'row',flexWrap:'wrap',gap:5,padding:10,backgroundColor:W,borderTopWidth:1,borderTopColor:'rgba(0,191,255,0.07)'},
+  token:{borderRadius:10,paddingHorizontal:9,paddingVertical:4,borderWidth:1},
+  tokenOk:{backgroundColor:'#f0f9ff',borderColor:'rgba(0,191,255,0.3)'},
+  tokenBad:{backgroundColor:'#fff5f5',borderColor:'#fca5a5'},
+  compose:{flexDirection:'row',gap:10,padding:12,backgroundColor:W,borderTopWidth:1,borderTopColor:'rgba(0,191,255,0.1)'},
+  compInput:{flex:1,backgroundColor:'#f8fbff',borderRadius:22,paddingHorizontal:18,paddingVertical:12,fontSize:15,color:'#1e293b',borderWidth:1.5,borderColor:'rgba(0,191,255,0.2)',maxHeight:120},
+  sendBtn:{width:48,height:48,borderRadius:16,backgroundColor:BLUE,alignItems:'center',justifyContent:'center',...SH},
+  sendIcon:{fontSize:20,color:W,fontWeight:'700'},
+  fab:{position:'absolute',bottom:30,right:24,width:60,height:60,borderRadius:20,backgroundColor:BLUE,alignItems:'center',justifyContent:'center',...SH},
+  overlay:{flex:1,backgroundColor:'rgba(0,0,0,0.4)',justifyContent:'flex-end'},
+  modal:{backgroundColor:W,borderTopLeftRadius:30,borderTopRightRadius:30,padding:30,paddingBottom:50},
+  modalInput:{backgroundColor:'#f8fbff',borderRadius:18,paddingHorizontal:18,paddingVertical:14,fontSize:18,color:'#1e293b',borderWidth:1.5,borderColor:'rgba(0,191,255,0.25)',marginBottom:16},
+  modalBtn:{backgroundColor:BLUE,borderRadius:18,paddingVertical:16,alignItems:'center',...SH},
+  modalBtnTxt:{color:W,fontWeight:'700',fontSize:16},
+});
+""")
+
+          print("All source files written.")
+          PYEOF
+
+      - name: Build Debug APK
+        working-directory: BuzziApp/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUZZI-debug-apk
+          path: BuzziApp/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
